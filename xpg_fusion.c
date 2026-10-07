@@ -629,5 +629,5 @@ static struct usb_driver xpg_driver = {
 module_usb_driver(xpg_driver);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("forth");
+MODULE_AUTHOR("Nikita Staroverov <nsforth@gmail.com>");
 MODULE_DESCRIPTION("hwmon driver for XPG Fusion 1600W Titanium PSU (read-only)");
