@@ -7,8 +7,7 @@
  * goes over control transfers on EP0: HID Feature Report ID 7, exactly a
  * 257-byte buffer.
  *
- * Protocol (recovered from XPG Prime, resources/app.asar, FusionSeries.js +
- * live probing; see xpg_fusion_monitor.py):
+ * Protocol:
  *   request:  SET_REPORT  bmReq=0x21 bReq=0x09 wValue=0x0307 len=257
  *             [0]=0x07 [1]=0x00 [2]=command [3..254]=0 [255]=PEC
  *   response: GET_REPORT  bmReq=0xA1 bReq=0x01 wValue=0x0307 wLength=257
@@ -57,14 +56,10 @@
 #define INTERVAL_MIN_SEC	1
 #define INTERVAL_MAX_SEC	60
 #define INTERVAL_DEF_SEC	1
-#define BACKOFF_START_ERRS	3
-#define BACKOFF_MAX_MS		10000
 
 static int interval_sec = INTERVAL_DEF_SEC;
 module_param(interval_sec, int, 0444);
 MODULE_PARM_DESC(interval_sec, "Poll interval in seconds (default 1, range 1..60)");
-
-/* --- PEC: exact port of PmbusAPIs.calcPEC from XPG Prime ------------------- */
 
 static const u8 pec_hi_crc[16] = {
 	0x00, 0x70, 0xE0, 0x90, 0xC7, 0xB7, 0x27, 0x57,
@@ -91,10 +86,8 @@ static u8 report_pec(const u8 *buf)
 	return p;
 }
 
-/* --- Linear11 (Delta packing, port of PmbusAPIs.Linear11_Decoder) -----------
- * N = ((hi & 0x78) >> 3); if hi & 0x80, N -= 16   (range -16..7)
- * M = lo + (hi & 0x03) * 256; if hi & 0x04, M -= 1024   (-1024..1023)
- * X = M * 2^N. Returns X * mult in integer units (mV/mA/m°C/µW/RPM), s64.
+/* --- Linear11 (Delta packing) -----------
+ * Returns X * mult in integer units (mV/mA/m°C/µW/RPM).
  */
 static s64 l11_scaled(u8 lo, u8 hi, s64 mult)
 {
@@ -124,8 +117,6 @@ struct xpg_priv {
 	bool stopping;
 	u8 buf[REPORT_LEN];
 	bool valid;
-	unsigned long updated;
-	int err_streak;
 	s64 vin_mv;
 	s64 vout_mv;
 	s64 v5_mv;
@@ -147,23 +138,6 @@ static int xpg_interval_ms(void)
 {
 	int ms = clamp(interval_sec, INTERVAL_MIN_SEC, INTERVAL_MAX_SEC) * 1000;
 
-	return ms;
-}
-
-/* interval with backoff on error streaks (up to 10 s) */
-static int xpg_poll_interval_ms(struct xpg_priv *priv)
-{
-	int ms = xpg_interval_ms();
-	int shift;
-
-	if (priv->err_streak >= BACKOFF_START_ERRS) {
-		shift = priv->err_streak - BACKOFF_START_ERRS;
-		if (shift > 3)
-			shift = 3;
-		ms *= 1 << shift;
-		if (ms > BACKOFF_MAX_MS)
-			ms = BACKOFF_MAX_MS;
-	}
 	return ms;
 }
 
@@ -261,14 +235,12 @@ static int xpg_refresh(struct xpg_priv *priv)
 	xpg_decode_full(priv, priv->buf);
 	xpg_sanity_check(priv, &priv->intf->dev);
 
-	/* POUT is fresh from a separate command (as in XPG Prime) */
+	/* POUT is fresh from a separate command */
 	rc = xpg_transfer(priv, CMD_READ_POUT);
 	if (rc)
 		return rc;
 	priv->pout_uw = l11_scaled(priv->buf[3], priv->buf[4], 1000000);
 
-	priv->valid = true;
-	priv->updated = jiffies;
 	return 0;
 }
 
@@ -283,12 +255,14 @@ static void xpg_poll(struct work_struct *ws)
 	mutex_lock(&priv->io_lock);
 	rc = xpg_refresh(priv);
 	if (rc) {
-		priv->err_streak++;
-		if (priv->err_streak == 1)
-			dev_warn(&priv->intf->dev,
-				 "PSU poll: error %d, backoff enabled\n", rc);
+		if (priv->valid)
+			dev_err(&priv->intf->dev,
+				"PSU contact lost (error %d)\n", rc);
+		priv->valid = false;
 	} else {
-		priv->err_streak = 0;
+		if (!priv->valid)
+			dev_info(&priv->intf->dev, "PSU contact restored\n");
+		priv->valid = true;
 	}
 
 	/* Re-arm under the same io_lock that disconnect/suspend set
@@ -298,7 +272,7 @@ static void xpg_poll(struct work_struct *ws)
 	 * return with a pending timer after priv is freed (UAF). */
 	if (!priv->stopping)
 		schedule_delayed_work(&priv->poll,
-				      msecs_to_jiffies(xpg_poll_interval_ms(priv)));
+				      msecs_to_jiffies(xpg_interval_ms()));
 	mutex_unlock(&priv->io_lock);
 }
 
@@ -319,28 +293,17 @@ static int xpg_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			  u32 attr, int channel, long *val)
 {
 	struct xpg_priv *priv = dev_get_drvdata(dev);
-	unsigned long now;
 	int rc;
 
-	/* All cache access is under io_lock: the fields are plain (no
-	 * own lock), and the stale check is atomic with respect to refresh.
-	 * hwmon serializes its own readers with its own mutex; a stale cache
-	 * is refreshed synchronously, fresh reads hold the lock briefly. */
+	/* Cache access is under io_lock (fields are plain, no own lock).
+	 * Freshness is maintained by the background poll; on a lost
+	 * contact (or before the first successful poll) reads report an
+	 * error instead of serving stale values. hwmon serializes its own
+	 * readers with its own mutex; reads here hold the lock briefly. */
 	mutex_lock(&priv->io_lock);
-	if (priv->stopping) {
+	if (priv->stopping || !priv->valid) {
 		mutex_unlock(&priv->io_lock);
 		return -ESHUTDOWN;
-	}
-
-	now = jiffies;
-	if (!priv->valid ||
-	    time_after(now, priv->updated +
-		       msecs_to_jiffies(xpg_interval_ms() + 1000))) {
-		rc = xpg_refresh(priv);
-		if (rc) {
-			mutex_unlock(&priv->io_lock);
-			return rc;
-		}
 	}
 
 	rc = 0;
@@ -604,7 +567,6 @@ static int xpg_resume(struct usb_interface *intf)
 
 	mutex_lock(&priv->io_lock);
 	priv->stopping = false;
-	priv->err_streak = 0;
 	priv->valid = false;
 	mutex_unlock(&priv->io_lock);
 	schedule_delayed_work(&priv->poll,
