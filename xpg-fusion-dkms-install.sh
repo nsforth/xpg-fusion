@@ -17,7 +17,7 @@ fi
 
 dkms install "${PKG_NAME}/${PKG_VERSION}" -k "${KERNEL}"
 
-# Если БП уже подключён, udev не повторяет modalias-matching — подтолкнуть:
+# If the PSU is already connected, udev does not re-run modalias matching — nudge it:
 udevadm trigger
 
 echo ">> Installed:"

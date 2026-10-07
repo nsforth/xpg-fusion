@@ -1,24 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * xpg_fusion.c — hwmon-драйвер БП XPG Fusion 1600W Titanium (Delta Electronics,
- * GPS-1600AB, VID 0x125F / PID 0x7900).
+ * xpg_fusion.c — hwmon driver for the XPG Fusion 1600W Titanium PSU
+ * (Delta Electronics, GPS-1600AB, VID 0x125F / PID 0x7900).
  *
- * Устройство — виртуальный HID без endpoint'ов (bNumEndpoints=0), весь обмен —
- * control transfer на EP0: HID Feature Report ID 7, буфер ровно 257 байт.
+ * The device is a virtual HID with no endpoints (bNumEndpoints=0); all I/O
+ * goes over control transfers on EP0: HID Feature Report ID 7, exactly a
+ * 257-byte buffer.
  *
- * Протокол (восстановлен из XPG Prime, resources/app.asar, FusionSeries.js +
- * живые зонды; см. xpg_fusion_monitor.py):
- *   запрос:  SET_REPORT  bmReq=0x21 bReq=0x09 wValue=0x0307 len=257
- *            [0]=0x07 [1]=0x00 [2]=команда [3..254]=0 [255]=PEC
- *   ответ:   GET_REPORT  bmReq=0xA1 bReq=0x01 wValue=0x0307 wLength=257
- *            [0]=0x07 [1]=0x00 [2]=эхо [3..254]=данные [255]=PEC
- *   PEC: CRC-8 (PMBus) по байтам 0..254. Без правильного PEC MCU молча
- *        отбрасывает команду (USB ACK, репорт нулевой) — валидируем echo+PEC.
+ * Protocol (recovered from XPG Prime, resources/app.asar, FusionSeries.js +
+ * live probing; see xpg_fusion_monitor.py):
+ *   request:  SET_REPORT  bmReq=0x21 bReq=0x09 wValue=0x0307 len=257
+ *             [0]=0x07 [1]=0x00 [2]=command [3..254]=0 [255]=PEC
+ *   response: GET_REPORT  bmReq=0xA1 bReq=0x01 wValue=0x0307 wLength=257
+ *             [0]=0x07 [1]=0x00 [2]=echo [3..254]=data [255]=PEC
+ *   PEC: CRC-8 (PMBus) over bytes 0..254. Without a correct PEC the MCU
+ *        silently drops the command (USB ACK, all-zero report) — we validate
+ *        the echo + PEC.
  *
- * Только read-команды: 0xDF (FULLPACKAGE), 0x96 (POUT), 0x99/0x9A/0xDC (MFR).
- * Записей в устройство НЕ отправляем.
+ * Read-only commands only: 0xDF (FULLPACKAGE), 0x96 (POUT), 0x99/0x9A/0xDC (MFR).
+ * Nothing is written to the device.
  *
- * Проверено: ядро 7.0.0-34-generic (Ubuntu 26.04).
+ * Tested: kernel 7.0.0-34-generic (Ubuntu 26.04).
  */
 
 #include <linux/device.h>
@@ -33,7 +35,7 @@
 #define XPG_VID		0x125F
 #define XPG_PID		0x7900
 
-#define REPORT_LEN	257		/* 1 (Report ID) + 256 (данные) */
+#define REPORT_LEN	257		/* 1 (Report ID) + 256 (data) */
 #define W_VALUE		0x0307		/* Feature Report, Report ID 7 */
 #define PEC_INDEX	255
 
@@ -62,7 +64,7 @@ static int interval_sec = INTERVAL_DEF_SEC;
 module_param(interval_sec, int, 0444);
 MODULE_PARM_DESC(interval_sec, "Poll interval in seconds (default 1, range 1..60)");
 
-/* --- PEC: точный порт PmbusAPIs.calcPEC из XPG Prime ------------------------ */
+/* --- PEC: exact port of PmbusAPIs.calcPEC from XPG Prime ------------------- */
 
 static const u8 pec_hi_crc[16] = {
 	0x00, 0x70, 0xE0, 0x90, 0xC7, 0xB7, 0x27, 0x57,
@@ -89,10 +91,10 @@ static u8 report_pec(const u8 *buf)
 	return p;
 }
 
-/* --- Linear11 (укладка Delta, порт PmbusAPIs.Linear11_Decoder) ---------------
- * N = ((hi & 0x78) >> 3); если hi & 0x80, N -= 16   (диапазон -16..7)
- * M = lo + (hi & 0x03) * 256; если hi & 0x04, M -= 1024   (-1024..1023)
- * X = M * 2^N. Возвращаем X * mult в целых (mV/mA/m°C/µW/RPM), s64.
+/* --- Linear11 (Delta packing, port of PmbusAPIs.Linear11_Decoder) -----------
+ * N = ((hi & 0x78) >> 3); if hi & 0x80, N -= 16   (range -16..7)
+ * M = lo + (hi & 0x03) * 256; if hi & 0x04, M -= 1024   (-1024..1023)
+ * X = M * 2^N. Returns X * mult in integer units (mV/mA/m°C/µW/RPM), s64.
  */
 static s64 l11_scaled(u8 lo, u8 hi, s64 mult)
 {
@@ -112,7 +114,7 @@ static s64 l11_scaled(u8 lo, u8 hi, s64 mult)
 	return -((-v + (1 << -n) / 2) >> -n);
 }
 
-/* --- Состояние устройства ---------------------------------------------------- */
+/* --- Device state ------------------------------------------------------------ */
 
 struct xpg_priv {
 	struct usb_interface *intf;
@@ -128,7 +130,7 @@ struct xpg_priv {
 	s64 vout_mv;
 	s64 v5_mv;
 	s64 v33_mv;
-	s64 vn12_mv;		/* |-12V|, модуль положительный (label "-12V") */
+	s64 vn12_mv;		/* |-12V|, magnitude is positive (label "-12V") */
 	s64 iin_ma;
 	s64 rails_ma[10];	/* 12V1..6, -12V, +5V, +3.3V, +12V total */
 	s64 pin_uw;
@@ -148,7 +150,7 @@ static int xpg_interval_ms(void)
 	return ms;
 }
 
-/* интервал с backoff при сериях ошибок (до 10 с) */
+/* interval with backoff on error streaks (up to 10 s) */
 static int xpg_poll_interval_ms(struct xpg_priv *priv)
 {
 	int ms = xpg_interval_ms();
@@ -173,22 +175,22 @@ static void xpg_sanity_check(struct xpg_priv *priv, struct device *dev)
 } while (0)
 
 	XPG_WARN_IF(priv->vin_mv < 80000 || priv->vin_mv > 300000,
-		    "VIN вне диапазона: %lld mV\n", priv->vin_mv);
+		    "VIN out of range: %lld mV\n", priv->vin_mv);
 	XPG_WARN_IF(priv->vout_mv < 11000 || priv->vout_mv > 13500,
-		    "VOUT вне диапазона: %lld mV\n", priv->vout_mv);
+		    "VOUT out of range: %lld mV\n", priv->vout_mv);
 	XPG_WARN_IF(priv->temp_millic < -10000 || priv->temp_millic > 90000,
-		    "TEMP вне диапазона: %lld mC\n", priv->temp_millic);
+		    "TEMP out of range: %lld mC\n", priv->temp_millic);
 	XPG_WARN_IF(priv->fan_rpm < 0 || priv->fan_rpm > 3000,
-		    "FAN вне диапазона: %lld RPM\n", priv->fan_rpm);
+		    "FAN out of range: %lld RPM\n", priv->fan_rpm);
 	XPG_WARN_IF(priv->pout_uw < 0 || priv->pout_uw > 2000000000LL,
-		    "POUT вне диапазона: %lld uW\n", priv->pout_uw);
+		    "POUT out of range: %lld uW\n", priv->pout_uw);
 #undef XPG_WARN_IF
 }
 
-/* --- Обмен ------------------------------------------------------------------- */
+/* --- Transfer ---------------------------------------------------------------- */
 
-/* Один полный цикл: SET(cmd) -> 50мс -> GET -> 30мс -> валидация.
- * Ответ остаётся в priv->buf. Вызывать под io_lock. */
+/* One full cycle: SET(cmd) -> 50ms -> GET -> 30ms -> validation.
+ * The response is left in priv->buf. Must be called with io_lock held. */
 static int xpg_transfer(struct xpg_priv *priv, u8 cmd)
 {
 	u8 *b = priv->buf;
@@ -214,7 +216,7 @@ static int xpg_transfer(struct xpg_priv *priv, u8 cmd)
 		return rc < 0 ? rc : -EIO;
 	msleep(DELAY_AFTER_GET_MS);
 
-	/* MCU молча отбрасывает команды с неверным PEC/неизвестной командой */
+	/* The MCU silently drops commands with a bad PEC / unknown command */
 	if (b[2] != cmd || report_pec(b) != b[PEC_INDEX])
 		return -EPROTO;
 	return 0;
@@ -248,7 +250,7 @@ static void xpg_decode_full(struct xpg_priv *priv, const u8 *b)
 	priv->eff_pct = l11_scaled(b[112], b[113], 1);
 }
 
-/* FULLPACKAGE + POUT, кэш актуализирован. Вызывать под io_lock. */
+/* FULLPACKAGE + POUT, cache is up to date. Must be called with io_lock held. */
 static int xpg_refresh(struct xpg_priv *priv)
 {
 	int rc;
@@ -259,7 +261,7 @@ static int xpg_refresh(struct xpg_priv *priv)
 	xpg_decode_full(priv, priv->buf);
 	xpg_sanity_check(priv, &priv->intf->dev);
 
-	/* POUT свежее из отдельной команды (как в XPG Prime) */
+	/* POUT is fresh from a separate command (as in XPG Prime) */
 	rc = xpg_transfer(priv, CMD_READ_POUT);
 	if (rc)
 		return rc;
@@ -270,7 +272,7 @@ static int xpg_refresh(struct xpg_priv *priv)
 	return 0;
 }
 
-/* --- Периодический опрос ------------------------------------------------------ */
+/* --- Periodic polling ---------------------------------------------------------- */
 
 static void xpg_poll(struct work_struct *ws)
 {
@@ -284,16 +286,16 @@ static void xpg_poll(struct work_struct *ws)
 		priv->err_streak++;
 		if (priv->err_streak == 1)
 			dev_warn(&priv->intf->dev,
-				 "Опрос БП: ошибка %d, включён backoff\n", rc);
+				 "PSU poll: error %d, backoff enabled\n", rc);
 	} else {
 		priv->err_streak = 0;
 	}
 
-	/* Re-arm под тем же io_lock, под которым disconnect/suspend ставят
-	 * stopping. Тогда к моменту cancel_delayed_work_sync таймер либо уже
-	 * pending (и будет снят), либо poll не реармировался: исключается
-	 * гонка, при которой sync-cancel возвращался бы с pending-таймером
-	 * после освобождения priv (UAF). */
+	/* Re-arm under the same io_lock that disconnect/suspend set
+	 * stopping on. By the time cancel_delayed_work_sync runs the timer
+	 * is either already pending (and will be removed) or the poll never
+	 * re-armed: this rules out the race in which a sync cancel would
+	 * return with a pending timer after priv is freed (UAF). */
 	if (!priv->stopping)
 		schedule_delayed_work(&priv->poll,
 				      msecs_to_jiffies(xpg_poll_interval_ms(priv)));
@@ -320,10 +322,10 @@ static int xpg_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 	unsigned long now;
 	int rc;
 
-	/* Весь доступ к кэшу под io_lock: поля plain (без own-lock), и
-	 * stale-check атомарен относительно refresh. hwmon свои читатели
-	 * сериализует собственным mutex'ом; устаревший кэш обновляется
-	 * синхронно, свежие чтения лока почти не держат. */
+	/* All cache access is under io_lock: the fields are plain (no
+	 * own lock), and the stale check is atomic with respect to refresh.
+	 * hwmon serializes its own readers with its own mutex; a stale cache
+	 * is refreshed synchronously, fresh reads hold the lock briefly. */
 	mutex_lock(&priv->io_lock);
 	if (priv->stopping) {
 		mutex_unlock(&priv->io_lock);
@@ -374,7 +376,7 @@ static int xpg_hwmon_read(struct device *dev, enum hwmon_sensor_types type,
 			break;
 		}
 		if (channel == 0)
-			*val = priv->pout_uw;	/* DC-выход, основная */
+			*val = priv->pout_uw;	/* DC output, primary */
 		else if (channel == 1)
 			*val = priv->pin_uw;
 		else
@@ -457,7 +459,7 @@ static const struct hwmon_chip_info xpg_chip_info = {
 	.info = xpg_channel_info,
 };
 
-/* --- Доп. RO-атрибуты: КПД, модель, FW --------------------------------------- */
+/* --- Extra RO attributes: efficiency, model, FW ----------------------------- */
 
 static ssize_t xpg_eff_show(struct device *dev,
 			    struct device_attribute *attr, char *buf)
@@ -465,7 +467,7 @@ static ssize_t xpg_eff_show(struct device *dev,
 	struct xpg_priv *priv = dev_get_drvdata(dev);
 	s64 eff;
 
-	/* eff_pct пишет poll; читаем под тем же io_lock */
+	/* eff_pct is written by poll; read it under the same io_lock */
 	mutex_lock(&priv->io_lock);
 	eff = priv->eff_pct;
 	mutex_unlock(&priv->io_lock);
@@ -512,7 +514,7 @@ static const struct attribute_group *xpg_attr_groups[] = {
 	NULL
 };
 
-/* --- USB-драйвер -------------------------------------------------------------- */
+/* --- USB driver --------------------------------------------------------------- */
 
 static void xpg_read_mfr_string(struct xpg_priv *priv, u8 cmd, char *dst, size_t len)
 {
@@ -540,16 +542,16 @@ static int xpg_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	INIT_DELAYED_WORK(&priv->poll, xpg_poll);
 	usb_set_intfdata(intf, priv);
 
-	/* Инфо об устройстве (best-effort) */
+	/* Device info (best effort) */
 	mutex_lock(&priv->io_lock);
 	xpg_read_mfr_string(priv, CMD_MFR_ID, priv->mfr, sizeof(priv->mfr));
 	xpg_read_mfr_string(priv, CMD_MFR_MODEL, priv->model, sizeof(priv->model));
 	xpg_read_mfr_string(priv, CMD_MFR_FW, priv->fw, sizeof(priv->fw));
 	mutex_unlock(&priv->io_lock);
 	dev_info(&intf->dev, "%s %s, FW %s\n",
-		 priv->mfr[0] ? priv->mfr : "(нет MFR_ID)",
-		 priv->model[0] ? priv->model : "(нет модели)",
-		 priv->fw[0] ? priv->fw : "(нет FW)");
+		 priv->mfr[0] ? priv->mfr : "(no MFR_ID)",
+		 priv->model[0] ? priv->model : "(no model)",
+		 priv->fw[0] ? priv->fw : "(no FW)");
 
 	hwmon_dev = devm_hwmon_device_register_with_info(
 		&intf->dev, DRIVER_NAME, priv, &xpg_chip_info, xpg_attr_groups);
@@ -559,7 +561,7 @@ static int xpg_probe(struct usb_interface *intf, const struct usb_device_id *id)
 	schedule_delayed_work(&priv->poll, 0);
 
 	dev_info(&intf->dev,
-		 "hwmon зарегистрирован, опрос каждые %d с (read-only)\n",
+		 "hwmon registered, polling every %d s (read-only)\n",
 		 interval_sec);
 	return 0;
 }
@@ -568,12 +570,14 @@ static void xpg_disconnect(struct usb_interface *intf)
 {
 	struct xpg_priv *priv = usb_get_intfdata(intf);
 
-	/* стоп-флаг под io_lock — тот же критический участок, в котором
-	 * poll решает, реармировать ли work (см. xpg_poll). Тогда к моменту
-	 * cancel_delayed_work_sync таймер либо уже pending (будет снят),
-	 * либо poll больше не реармируется: UAF priv исключён.
-	 * URB'ы убивать не нужно — usbcore уже их прервал до disconnect.
-	 * hwmon и priv освобождаются devm-механизмом после disconnect. */
+	/* Set the stopping flag under io_lock — the same critical section
+	 * in which poll decides whether to re-arm the work (see xpg_poll).
+	 * By the time cancel_delayed_work_sync runs the timer is either
+	 * already pending (and will be removed) or poll will never re-arm
+	 * again: UAF of priv is ruled out.
+	 * URBs do not need to be killed — usbcore has already aborted them
+	 * before disconnect. hwmon and priv are released by the devm
+	 * machinery after disconnect. */
 	mutex_lock(&priv->io_lock);
 	priv->stopping = true;
 	mutex_unlock(&priv->io_lock);
@@ -584,8 +588,9 @@ static int xpg_suspend(struct usb_interface *intf, pm_message_t msg)
 {
 	struct xpg_priv *priv = usb_get_intfdata(intf);
 
-	/* БП self-powered, во время suspend опрос не нужен. stopping под
-	 * io_lock — чтобы stray-реарм из xpg_poll не пережил cancel. */
+	/* The PSU is self-powered; polling is not needed while suspended.
+	 * stopping under io_lock — so a stray re-arm from xpg_poll cannot
+	 * outlive the cancel. */
 	mutex_lock(&priv->io_lock);
 	priv->stopping = true;
 	mutex_unlock(&priv->io_lock);
