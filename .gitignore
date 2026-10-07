@@ -1,0 +1,15 @@
+# Артефакты сборки (out-of-tree, dkms)
+*.o
+*.ko
+*.mod
+*.mod.o
+*.mod.c
+*.order
+Module.symvers
+
+# Служебные файлы kbuild (.<target>.cmd, .tmp_versions)
+.*.cmd
+.tmp_versions/
+
+# Локальная ссылка на дерево ядра (не входит в проект)
+/linux-7.0.0
