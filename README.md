@@ -52,9 +52,11 @@ for a temporary one). After removal, the userspace script
 
 - While the module is bound, XPG Prime / pyusb cannot open the device
   (-EBUSY). This is normal behavior (exclusive driver-core claim).
-- If the PSU is powered off on AC: control requests time out (2 s), polling
-  switches to backoff (×2, up to 10 s), `dev_warn_ratelimited` in dmesg.
-  The kernel is not blocked.
+- If the PSU is lost (AC power off, unplugged): polling fails, the driver
+  logs one `dev_err` ("PSU contact lost") and sysfs reads return an error
+  (-ESHUTDOWN) until the device answers again — on recovery a
+  "PSU contact restored" message is logged and values resume.
+  The kernel is not blocked; polling keeps running at the fixed interval.
 - The response is validated: command echo + PEC (CRC-8). The MCU silently
   drops commands with a bad PEC — the module reports this as -EPROTO.
 - −12V is exported with a positive sign, label "-12V" (dual-polarity rail).
