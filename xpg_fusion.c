@@ -28,6 +28,7 @@
 #include <linux/mutex.h>
 #include <linux/types.h>
 #include <linux/usb.h>
+#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #define DRIVER_NAME	"xpg_fusion"
@@ -413,9 +414,24 @@ static const struct hwmon_channel_info *const xpg_channel_info[] = {
 	NULL
 };
 
+/* Kernels before 6.13 have no static 'visible' field — use the
+ * is_visible callback instead (same effect: all attributes RO 0444). */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
+static umode_t xpg_is_visible(const void *drvdata,
+			      enum hwmon_sensor_types type, u32 attr,
+			      int channel)
+{
+	return 0444;
+}
+#endif
+
 static const struct hwmon_chip_info xpg_chip_info = {
 	.ops = &(const struct hwmon_ops) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 		.visible = 0444,
+#else
+		.is_visible = xpg_is_visible,
+#endif
 		.read = xpg_hwmon_read,
 		.read_string = xpg_hwmon_read_string,
 	},

@@ -5,7 +5,8 @@ VID 0x125F / PID 0x7900) and exports it via hwmon (lm_sensors / `sensors`).
 
 Read-only: the module sends PMBus read commands only
 (0xDF FULLPACKAGE, 0x96 POUT, 0x99/0x9A/0xDC MFR strings). No writes.
-Tested with kernel 7.0.0-34-generic (Ubuntu 26.04).
+Tested with kernels 7.0.0-34-generic (Ubuntu 26.04) and 6.8.0-107-generic
+(Ubuntu 22.04.5, HWE — dkms 3.3, lm-sensors 3.6.0).
 
 ## Channels
 
@@ -32,12 +33,14 @@ efficiency — without XPG Prime's marketing corrections), `model`,
 
 ```
 sudo ./xpg-fusion-dkms-build.sh      # dkms add + build
-sudo ./xpg-fusion-dkms-install.sh    # dkms install + udevadm trigger
+sudo ./xpg-fusion-dkms-install.sh    # dkms install + modprobe
 ```
 
 The module is picked up by udev automatically via the `usb:v125Fp7900...`
 alias (plug in the PSU — the module loads). If the PSU is already connected
-at install time, the script runs `udevadm trigger`.
+at install time, the script runs `modprobe xpg-fusion` (no new uevent
+arrives, so udev never re-runs the modalias matching; the usb core probes
+already-present devices when the driver registers).
 
 Uninstall: `dkms remove xpg-fusion/1.0 --all` (or `sudo rmmod xpg-fusion`
 for a temporary one). After removal, the userspace script
@@ -47,6 +50,33 @@ for a temporary one). After removal, the userspace script
 
 - `interval_sec` (default 1) — polling interval in seconds (1..60).
   `modprobe xpg-fusion interval_sec=2`.
+
+## Monitoring
+
+### CLI (reads the hwmon sysfs, no root required):
+
+```
+./xpg-fusion-monitor.sh        # live table every 1 s
+PSU: GPS-1600AB A   FW: 06.18-06.25-01.15
+time       DC-out    AC-in  eff%  psu%     GaN  12Vtot      fan
+23:26:24  422.0 W  515.0 W    82    90  52.0 C  37.4 A    0 rpm
+23:26:25  297.0 W  399.0 W    74    92  52.0 C  23.5 A    0 rpm
+...
+```
+or
+```
+./xpg-fusion-monitor.sh 5      # every 5 s
+```
+
+Columns: DC output / AC input power, computed efficiency (from
+pout/pin) alongside the PSU-reported one (`efficiency_percent`),
+GaN temperature, +12V total current (PSU-measured), fan RPM; prints
+model and firmware from the MFR attributes in the header.
+
+### Grafana: the [myserv-mon](https://github.com/alex4men/myserv-mon)
+
+Prometheus + Grafana stack ships an "XPG Fusion PSU" dashboard that
+supports this module.
 
 ## Known behavior
 
